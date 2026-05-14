@@ -1,0 +1,11 @@
+data/
+outputs/
+*.tif
+*.IMG
+*.LBL
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/settings.json
