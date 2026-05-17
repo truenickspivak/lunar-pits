@@ -1,13 +1,8 @@
-"""
-Process one LROC NAC EDR product from IMG ID to final GeoTIFF.
+"""Process one LROC NAC EDR product from IMG ID to final GeoTIFF.
 
-Windows-side controller:
-- Finds the IMG URL in the LROC PDS EDR archive collection CSV files.
-- Downloads only the IMG to a temporary WSL-native workspace.
-- Runs ISIS inside WSL/Ubuntu.
-- Uses spiceinit web=yes to avoid local full-LRO ISISDATA download.
-- Copies only the final TIFF back to the Windows project folder.
-- Deletes temporary IMG/CUB files by default.
+On Windows, this preserves the existing WSL/ISIS execution behavior. On Linux
+cloud workers, the same command sequence runs natively through bash and the
+``isis9.0.0`` conda environment.
 """
 
 from __future__ import annotations
@@ -27,10 +22,13 @@ from lunarpits.processing.identifiers import normalize_product_id
 
 
 PROJECT_WIN = Path(r"C:\Users\nicks\desktop\lunar-pits")
+if not sys.platform.startswith("win"):
+    PROJECT_WIN = Path(__file__).resolve().parents[3]
 PDS_ROOT = "https://pds.lroc.im-ldi.com/data/LRO-L-LROC-2-EDR-V1.0"
 WSL_WORK_ROOT = "/tmp/lunar-pits-work"
 WSL_CACHE_ROOT = "/tmp/lunar-pits-cache"
 ISIS_ENV_NAME = "isis9.0.0"
+IS_WINDOWS = sys.platform.startswith("win")
 OUT_DIR_WIN = PROJECT_WIN / "data" / "processed" / "lroc_tif"
 TILE_OUT_DIR_WIN = PROJECT_WIN / "data" / "processed" / "lroc_tile_tif"
 
@@ -94,6 +92,8 @@ def configure_logging(verbose: bool = False) -> None:
 def win_to_wsl(path: Path) -> str:
     """Convert C:\\foo\\bar to /mnt/c/foo/bar."""
     path = path.resolve()
+    if not IS_WINDOWS:
+        return path.as_posix()
     drive = path.drive[0].lower()
     rest = str(path)[3:].replace("\\", "/")
     return f"/mnt/{drive}/{rest}"
@@ -158,20 +158,22 @@ def build_processing_plan(
 
 
 def run_wsl_shell(command: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    """Run a normal shell command inside WSL."""
-    LOGGER.info("\n[WSL] %s\n", command)
+    """Run a normal shell command inside WSL on Windows or bash on Linux."""
+    LOGGER.info("\n[%s] %s\n", "WSL" if IS_WINDOWS else "bash", command)
+    runner = ["wsl", "bash", "-lc", command] if IS_WINDOWS else ["bash", "-lc", command]
     return subprocess.run(
-        ["wsl", "bash", "-lc", command],
+        runner,
         text=True,
         check=check,
     )
 
 
 def run_wsl_shell_capture(command: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    """Run a normal shell command inside WSL and capture output."""
-    LOGGER.debug("\n[WSL capture] %s\n", command)
+    """Run a normal shell command and capture output."""
+    LOGGER.debug("\n[%s capture] %s\n", "WSL" if IS_WINDOWS else "bash", command)
+    runner = ["wsl", "bash", "-lc", command] if IS_WINDOWS else ["bash", "-lc", command]
     return subprocess.run(
-        ["wsl", "bash", "-lc", command],
+        runner,
         text=True,
         check=check,
         capture_output=True,
@@ -179,22 +181,24 @@ def run_wsl_shell_capture(command: str, *, check: bool = True) -> subprocess.Com
 
 
 def run_isis(command: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    """Run an ISIS command inside the configured WSL conda environment."""
+    """Run an ISIS command inside the configured conda environment."""
     full_cmd = f"~/miniforge3/bin/conda run -n {ISIS_ENV_NAME} {command}"
     LOGGER.info("\n[ISIS] %s\n", command)
+    runner = ["wsl", "bash", "-lc", full_cmd] if IS_WINDOWS else ["bash", "-lc", full_cmd]
     return subprocess.run(
-        ["wsl", "bash", "-lc", full_cmd],
+        runner,
         text=True,
         check=check,
     )
 
 
 def run_isis_capture(command: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    """Run an ISIS command inside WSL and capture output."""
+    """Run an ISIS command and capture output."""
     full_cmd = f"~/miniforge3/bin/conda run -n {ISIS_ENV_NAME} {command}"
     LOGGER.debug("\n[ISIS capture] %s\n", command)
+    runner = ["wsl", "bash", "-lc", full_cmd] if IS_WINDOWS else ["bash", "-lc", full_cmd]
     return subprocess.run(
-        ["wsl", "bash", "-lc", full_cmd],
+        runner,
         text=True,
         check=check,
         capture_output=True,
@@ -511,7 +515,7 @@ def process_product(
     LOGGER.info("[plan] pixel_resolution=%s meters/pixel", plan.pixel_resolution)
 
     if dry_run:
-        LOGGER.info("[dry-run] No PDS download, WSL command, or ISIS command will be run.")
+        LOGGER.info("[dry-run] No PDS download, shell command, or ISIS command will be run.")
         return LrocProcessingResult(product_id, plan.final_tif_win, dry_run=True)
 
     ensure_final_dir(plan.final_tif_win.parent)
