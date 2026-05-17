@@ -49,6 +49,14 @@ class MlTilesTest(unittest.TestCase):
         b = apply_ml_normalization(np.array([[-20.0, 50.0]], dtype=np.float32), policy)
         self.assertAlmostEqual(float(a[0, 0]), float(b[0, 1]))
 
+    def test_soft_percentile_clip_scales_each_tile_with_recorded_policy(self):
+        policy = MlScalingPolicy(normalization_policy="soft_percentile_clip", percentile_low=1.0, percentile_high=99.0)
+        arr = np.array([[0.0, 1.0, 2.0, 100.0]], dtype=np.float32)
+        scaled = apply_ml_normalization(arr, policy)
+        self.assertEqual(scaled.dtype, np.float32)
+        self.assertGreaterEqual(float(scaled.min()), 0.0)
+        self.assertLessEqual(float(scaled.max()), 1.0)
+
     def test_preview_uses_fixed_constants(self):
         policy = MlScalingPolicy(normalization_policy="preserve_float32", preview_min=0.0, preview_max=100.0)
         dark_tile = render_ml_preview(np.array([[50.0]], dtype=np.float32), policy)

@@ -2,8 +2,8 @@
 
 This is the efficient path: run ISIS cam2map once for the full NAC
 observation, then reproject/crop the deterministic global tile afterward.
-The saved PNG is an ML preview, not a browse image: it uses the same fixed
-scaling policy everywhere and never computes tile-local display statistics.
+The saved PNG is the human view of the same values written to the ML tile.
+It does not create a separate enhanced browse image.
 """
 
 from __future__ import annotations
@@ -178,6 +178,18 @@ def crop_fixed_tile(
 
     valid = np.isfinite(raw_projected) & (raw_projected != policy.nodata_value)
     ml_valid = np.isfinite(ml_arr) & (ml_arr != policy.nodata_value)
+    norm_constants = {
+        "ml_clip_min": policy.ml_clip_min,
+        "ml_clip_max": policy.ml_clip_max,
+        "percentile_low": policy.percentile_low if policy.normalization_policy == "soft_percentile_clip" else None,
+        "percentile_high": policy.percentile_high if policy.normalization_policy == "soft_percentile_clip" else None,
+        "computed_percentile_low_value": None,
+        "computed_percentile_high_value": None,
+    }
+    if policy.normalization_policy == "soft_percentile_clip" and valid.any():
+        lo, hi = np.percentile(raw_projected[valid], [policy.percentile_low, policy.percentile_high])
+        norm_constants["computed_percentile_low_value"] = float(lo)
+        norm_constants["computed_percentile_high_value"] = float(hi)
     metadata = {
         "source_nac_id": product_id,
         "source_tif": str(tif_path),
@@ -212,10 +224,7 @@ def crop_fixed_tile(
             "pixel_y": target_pixel["pixel_y"],
         },
         "normalization_policy": policy.normalization_policy,
-        "normalization_constants": {
-            "ml_clip_min": policy.ml_clip_min,
-            "ml_clip_max": policy.ml_clip_max,
-        },
+        "normalization_constants": norm_constants,
         "preview_scaling_policy": "source_product_percentile" if preview_scale_mode == "source_percentile" else "fixed_global_clip_for_preview",
         "preview_scaling_constants": {
             "preview_scale_mode": preview_scale_mode,
@@ -283,11 +292,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--product-id", default=None)
     parser.add_argument("--out", default=None, help="Output ML tile TIFF path")
     parser.add_argument("--policy-config", default=str(PROJECT_ROOT / "config" / "ml_tile_policy.yaml"))
-    parser.add_argument("--normalization-policy", choices=["preserve_float32", "fixed_global_clip", "dataset_percentile_constants"], default=None)
+    parser.add_argument("--normalization-policy", choices=["preserve_float32", "fixed_global_clip", "dataset_percentile_constants", "soft_percentile_clip"], default=None)
     parser.add_argument("--preview-min", type=float, default=None)
     parser.add_argument("--preview-max", type=float, default=None)
     parser.add_argument("--ml-clip-min", type=float, default=None)
     parser.add_argument("--ml-clip-max", type=float, default=None)
+    parser.add_argument("--percentile-low", type=float, default=None)
+    parser.add_argument("--percentile-high", type=float, default=None)
     parser.add_argument("--nodata-value", type=float, default=None)
     parser.add_argument("--nearest", action="store_true", help="Use nearest-neighbor resampling instead of bilinear")
     parser.add_argument(
@@ -310,6 +321,8 @@ def policy_from_args(args: argparse.Namespace) -> MlScalingPolicy:
         ("preview_max", "preview_max"),
         ("ml_clip_min", "ml_clip_min"),
         ("ml_clip_max", "ml_clip_max"),
+        ("percentile_low", "percentile_low"),
+        ("percentile_high", "percentile_high"),
         ("nodata_value", "nodata_value"),
     ):
         value = getattr(args, arg_name)

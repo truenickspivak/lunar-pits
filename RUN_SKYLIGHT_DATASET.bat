@@ -11,6 +11,8 @@ echo Starting skylight dataset runner...
 echo Repo: %CD%
 echo Log: %LOG_PATH%
 echo Queue: data\dataset_queue.csv
+echo Positive audit: data\dataset_positive_coordinate_audit.csv
+echo Run summary: data\dataset_run_summary.json
 echo.
 
 where conda >nul 2>nul
@@ -29,6 +31,8 @@ echo.
 echo Finished with exit code %EXIT_CODE%.
 echo Log: %LOG_PATH%
 echo Queue: data\dataset_queue.csv
+echo Positive audit: data\dataset_positive_coordinate_audit.csv
+echo Run summary: data\dataset_run_summary.json
 echo.
 pause
 exit /b %EXIT_CODE%

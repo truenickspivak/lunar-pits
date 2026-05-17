@@ -471,6 +471,7 @@ def process_product(
     pixel_resolution: float = 0.5,
     tile_map: TileMapBounds | None = None,
     output_dir: Path | None = None,
+    img_url: str | None = None,
     keep_temp: bool = False,
     max_volume: int = 80,
     skip_if_exists: bool = False,
@@ -544,7 +545,11 @@ def process_product(
             LOGGER.info("[cache] Reusing calibrated ISIS cube: %s", cached_cal_wsl)
             timed_step("copy cached calibrated cube", run_wsl_shell, f"cp '{cached_cal_wsl}' '{cal_wsl}'")
         else:
-            located = locate_product_in_collections(product_id, max_volume=max_volume)
+            located = (
+                LocatedProduct(product_id, "direct_url", "", img_url, None)
+                if img_url
+                else locate_product_in_collections(product_id, max_volume=max_volume)
+            )
             LOGGER.info("[located] %s", located.img_url)
             timed_step("download IMG", download_url_to_wsl, located.img_url, img_wsl)
             timed_step("lronac2isis", run_isis, f"lronac2isis from='{img_wsl}' to='{cub_wsl}'")
@@ -651,6 +656,7 @@ def process_product_to_geotiff(
     tile_lon: float | None = None,
     tile_size_km: float | None = None,
     output_dir: str | Path | None = None,
+    img_url: str | None = None,
     keep_temp: bool = False,
     max_volume: int = 80,
     skip_if_exists: bool = False,
@@ -677,6 +683,7 @@ def process_product_to_geotiff(
         pixel_resolution=pixel_resolution,
         tile_map=tile_map,
         output_dir=Path(output_dir) if output_dir is not None else None,
+        img_url=img_url,
         keep_temp=keep_temp,
         max_volume=max_volume,
         skip_if_exists=skip_if_exists,
@@ -702,6 +709,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tile-lon", type=float, default=None, help="Optional target longitude for deterministic fixed-tile cam2map output.")
     parser.add_argument("--tile-size-km", type=float, default=None, help="Optional deterministic tile size in km. Requires --tile-lat and --tile-lon.")
     parser.add_argument("--output-dir", default=None, help="Optional output directory for final GeoTIFF. Defaults to the standard processed location.")
+    parser.add_argument("--img-url", default=None, help="Optional direct PDS IMG URL from ODE/PDS search; skips collection path rediscovery.")
     parser.add_argument("--pixel-resolution", type=float, default=0.5, help="Output map pixel resolution in meters/pixel")
     parser.add_argument("--keep-temp", action="store_true", help="Do not delete WSL temp workspace after processing")
     parser.add_argument("--max-volume", type=int, default=80, help="Maximum LROLRC volume number to search")
@@ -753,6 +761,7 @@ def main(argv: list[str] | None = None) -> int:
             pixel_resolution=args.pixel_resolution,
             tile_map=tile_map,
             output_dir=Path(args.output_dir) if args.output_dir else None,
+            img_url=args.img_url,
             keep_temp=args.keep_temp,
             max_volume=args.max_volume,
             skip_if_exists=args.skip_if_exists,

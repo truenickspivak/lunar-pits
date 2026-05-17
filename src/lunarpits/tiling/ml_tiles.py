@@ -1,4 +1,4 @@
-"""Production lunar ML tile grid and fixed radiometric preview policy.
+"""Production lunar ML tile grid and recorded radiometric preview policy.
 
 This module is intentionally separate from the older exploratory
 ``lunar_tile_pipeline`` grid.  The production ML grid uses tile indices
@@ -26,6 +26,7 @@ PRODUCTION_NORMALIZATION_POLICIES = {
     "preserve_float32",
     "fixed_global_clip",
     "dataset_percentile_constants",
+    "soft_percentile_clip",
 }
 FORBIDDEN_PRODUCTION_NAME_TOKENS = (
     "browse",
@@ -75,6 +76,8 @@ class MlScalingPolicy:
     preview_max: float = DEFAULT_PREVIEW_MAX
     ml_clip_min: float | None = None
     ml_clip_max: float | None = None
+    percentile_low: float = 1.0
+    percentile_high: float = 99.0
     nodata_value: float = DEFAULT_NODATA_VALUE
 
     def __post_init__(self) -> None:
@@ -87,6 +90,9 @@ class MlScalingPolicy:
                 raise ValueError(f"{self.normalization_policy} requires ml_clip_min and ml_clip_max.")
             if not self.ml_clip_max > self.ml_clip_min:
                 raise ValueError("ml_clip_max must be greater than ml_clip_min.")
+        if self.normalization_policy == "soft_percentile_clip":
+            if not 0.0 <= self.percentile_low < self.percentile_high <= 100.0:
+                raise ValueError("soft_percentile_clip requires 0 <= percentile_low < percentile_high <= 100.")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -246,16 +252,26 @@ def snap_bounds_to_tile_grid(
 
 
 def apply_ml_normalization(arr: np.ndarray, policy: MlScalingPolicy) -> np.ndarray:
-    """Return the production ML array with no local statistics."""
+    """Return the production tile array according to the configured policy."""
     out = np.asarray(arr, dtype="float32")
     if policy.normalization_policy == "preserve_float32":
         return out
+    if policy.normalization_policy == "soft_percentile_clip":
+        valid = np.isfinite(out) & (out != policy.nodata_value)
+        if not valid.any():
+            return np.full(out.shape, policy.nodata_value, dtype="float32")
+        lo, hi = np.percentile(out[valid], [policy.percentile_low, policy.percentile_high])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return np.full(out.shape, policy.nodata_value, dtype="float32")
+        scaled = np.full(out.shape, policy.nodata_value, dtype="float32")
+        scaled[valid] = np.clip((out[valid] - lo) / (hi - lo), 0.0, 1.0)
+        return scaled
     clipped = np.clip(out, float(policy.ml_clip_min), float(policy.ml_clip_max))
     return ((clipped - float(policy.ml_clip_min)) / (float(policy.ml_clip_max) - float(policy.ml_clip_min))).astype("float32")
 
 
 def render_ml_preview(arr: np.ndarray, policy: MlScalingPolicy) -> np.ndarray:
-    """Render an 8-bit PNG preview using fixed constants only."""
+    """Render the human-visible PNG from the same values saved for ML."""
     values = np.asarray(arr, dtype="float32")
     finite = np.isfinite(values)
     scaled = np.zeros(values.shape, dtype="float32")

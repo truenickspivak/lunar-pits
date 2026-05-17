@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
 import pandas as pd
+from shapely import wkt
 
 from lunar_tile_pipeline.footprints import load_footprints, tile_center_point_for_footprints, tile_polygon_for_footprints
 from lunar_tile_pipeline.tiling import LunarTile
@@ -30,6 +33,7 @@ MAX_USABLE_EMISSION_DEG = 45.0
 MAX_ALIGNED_EMISSION_DEG = 15.0
 MIN_USABLE_PHASE_DEG = 10.0
 MAX_USABLE_PHASE_DEG = 120.0
+ODE_REST_URL = "https://oderest.rsl.wustl.edu/live2"
 
 
 def parse_lroc_product_id(product_id: str) -> dict[str, str | None]:
@@ -131,6 +135,296 @@ def find_lroc_nac_edr_for_tile(tile: LunarTile, footprints_gdf: gpd.GeoDataFrame
 def find_lroc_nac_edr_for_tile_from_file(tile: LunarTile, footprints_path: str | Path) -> pd.DataFrame:
     gdf = load_footprints(footprints_path)
     return find_lroc_nac_edr_for_tile(tile, gdf, source_footprint_file=str(footprints_path))
+
+
+def find_lroc_nac_edr_for_tile_from_ode(
+    tile: LunarTile,
+    *,
+    limit: int = 80,
+    timeout: int = 90,
+    exact_coverage: bool = False,
+) -> pd.DataFrame:
+    """Find LROC NAC EDR products intersecting a tile using ODE REST.
+
+    The old LROC ``NAC_EQ_SCIENCE_MISSION_360`` shapefile is useful, but it is
+    not complete enough for the pit catalog or whole-Moon scans. ODE's product
+    endpoint with ``pt=EDRNAC4`` is the broader footprint-aware source: it
+    returns PDS4 LROC NAC EDR products whose footprints intersect the requested
+    lat/lon box, plus image URL, timing, angles, resolution, and footprint WKT.
+    """
+    bounds = tile.bounds_latlon
+    min_lat = float(bounds["min_lat_approx"])
+    max_lat = float(bounds["max_lat_approx"])
+    min_lon = float(bounds["min_lon_360_approx"])
+    max_lon = float(bounds["max_lon_360_approx"])
+    if bool(bounds.get("crosses_lon_360_wrap")):
+        parts = [(min_lon, 360.0), (0.0, max_lon)]
+    else:
+        parts = [(min_lon, max_lon)]
+
+    rows: list[dict[str, Any]] = []
+    for west, east in parts:
+        rows.extend(_ode_products_for_bbox(min_lat, max_lat, west, east, limit=limit, timeout=timeout))
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates(subset=["product_id"])
+    df = _add_ode_tile_coverage(df, tile) if exact_coverage else _add_ode_bbox_tile_coverage(df, tile)
+    return rank_lroc_nac_edr_for_tile(df)
+
+
+def _ode_products_for_bbox(min_lat: float, max_lat: float, west_lon: float, east_lon: float, *, limit: int, timeout: int) -> list[dict[str, Any]]:
+    params = {
+        "query": "product",
+        "target": "moon",
+        "results": "fopm",
+        "output": "JSON",
+        "ihid": "LRO",
+        "iid": "LROC",
+        "pt": "EDRNAC4",
+        "minlat": f"{min_lat:.8f}",
+        "maxlat": f"{max_lat:.8f}",
+        "westernlon": f"{west_lon:.8f}",
+        "easternlon": f"{east_lon:.8f}",
+        "loc": "i",
+        "limit": str(int(limit)),
+    }
+    url = f"{ODE_REST_URL}?{urllib.parse.urlencode(params)}"
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    results = payload.get("ODEResults", {})
+    if results.get("Status") == "ERROR":
+        raise RuntimeError(str(results.get("Error", "ODE REST query failed")))
+    products = results.get("Products", {}).get("Product", [])
+    if isinstance(products, dict):
+        products = [products]
+    records: list[dict[str, Any]] = []
+    for product in products:
+        record = _ode_product_to_record(product, url)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _ode_product_to_record(product: dict[str, Any], source_url: str) -> dict[str, Any] | None:
+    product_id = _ode_product_id(product)
+    if product_id is None:
+        return None
+    parsed = parse_lroc_product_id(product_id)
+    if parsed["camera"] not in {"NAC-L", "NAC-R"} or parsed["processing_level"] != "EDR":
+        return None
+    footprint_wkt = str(product.get("Footprint_geometry") or product.get("Footprint_GL_geometry") or "").strip()
+    geometry = None
+    if footprint_wkt:
+        try:
+            geometry = wkt.loads(footprint_wkt)
+        except Exception:
+            geometry = None
+    return {
+        "product_id": product_id,
+        "camera": parsed["camera"],
+        "processing_level": parsed["processing_level"],
+        "contains_center": False,
+        "intersects_tile": True,
+        "intersection_area_approx": None,
+        "tile_area_approx": None,
+        "tile_coverage_fraction": 1.0,
+        "full_tile_candidate": True,
+        "start_time": product.get("UTC_start_time") or product.get("Observation_time"),
+        "incidence_angle": _maybe_float(product.get("Incidence_angle")),
+        "emission_angle": _maybe_float(product.get("Emission_angle")),
+        "phase_angle": _maybe_float(product.get("Phase_angle")),
+        "resolution_m_per_pixel": _maybe_float(product.get("Map_resolution")),
+        "source_footprint_file": source_url,
+        "footprint_source": "ODE REST EDRNAC4 footprint intersection",
+        "coverage_method": "ode_footprint_intersects_tile",
+        "img_url": _ode_file_url(product, ".IMG"),
+        "label_url": product.get("LabelURL") or _ode_file_url(product, ".XML"),
+        "browse_url": _ode_browse_url(product),
+        "volume": product.get("PDSVolume_Id"),
+        "relative_path": product.get("RelativePathtoVol"),
+        "minimum_latitude": _maybe_float(product.get("Minimum_latitude")),
+        "maximum_latitude": _maybe_float(product.get("Maximum_latitude")),
+        "westernmost_longitude": _maybe_float(product.get("Westernmost_longitude")),
+        "easternmost_longitude": _maybe_float(product.get("Easternmost_longitude")),
+        "footprints_cross_meridian": product.get("Footprints_cross_meridian"),
+        "footprint_wkt": footprint_wkt,
+        "footprint_area_approx": float(geometry.area) if geometry is not None else None,
+        "ode_id": product.get("ode_id"),
+    }
+
+
+def _ode_product_id(product: dict[str, Any]) -> str | None:
+    for key in ("pdsid", "LabelFileName", "Product_name"):
+        value = product.get(key)
+        if not value:
+            continue
+        text = str(value).strip().upper()
+        if "." in text:
+            text = text.split(".")[-1]
+        if text.endswith(".IMG") or text.endswith(".XML"):
+            text = text.rsplit(".", 1)[0]
+        match = re.search(r"M\d+[LR][EC]", text)
+        if match:
+            parsed = parse_lroc_product_id(match.group(0))
+            if parsed["processing_level"] == "EDR":
+                return parsed["product_id"]
+            if parsed["processing_level"] == "CDR":
+                return f"{parsed['product_id'][:-1]}E"
+    return None
+
+
+def _ode_files(product: dict[str, Any]) -> list[dict[str, Any]]:
+    files = product.get("Product_files", {}).get("Product_file", [])
+    if isinstance(files, dict):
+        return [files]
+    return files if isinstance(files, list) else []
+
+
+def _ode_file_url(product: dict[str, Any], suffix: str) -> str | None:
+    suffix = suffix.upper()
+    for item in _ode_files(product):
+        name = str(item.get("FileName", "")).upper()
+        if name.endswith(suffix) and str(item.get("Type", "")).lower() == "product":
+            return item.get("URL")
+    return None
+
+
+def _ode_browse_url(product: dict[str, Any]) -> str | None:
+    for item in _ode_files(product):
+        if str(item.get("Type", "")).lower() == "browse":
+            return item.get("URL")
+    return None
+
+
+def _add_ode_bbox_tile_coverage(products: pd.DataFrame, tile: LunarTile) -> pd.DataFrame:
+    """Cheap tile-coverage estimate from ODE's product lat/lon bounds.
+
+    ODE already does the authoritative footprint intersection query. Parsing
+    and intersecting every returned WKT polygon is useful for diagnostics, but
+    it is avoidable overhead in the normal gatherer path. The final raster tile
+    QA is still the hard gate for black/partial products.
+    """
+    if products.empty:
+        return products
+    out = products.copy()
+    bounds = tile.bounds_latlon
+    tile_min_lat = float(bounds["min_lat_approx"])
+    tile_max_lat = float(bounds["max_lat_approx"])
+    tile_min_lon = float(bounds["min_lon_360_approx"])
+    tile_max_lon = float(bounds["max_lon_360_approx"])
+    tile_crosses_wrap = bool(bounds.get("crosses_lon_360_wrap"))
+    tile_lat_span = max(tile_max_lat - tile_min_lat, 1e-12)
+    tile_lon_span = _lon_interval_span(tile_min_lon, tile_max_lon, tile_crosses_wrap)
+    tile_area = tile_lat_span * max(tile_lon_span, 1e-12)
+
+    fractions: list[float] = []
+    for _, row in out.iterrows():
+        p_min_lat = _maybe_float(row.get("minimum_latitude"))
+        p_max_lat = _maybe_float(row.get("maximum_latitude"))
+        p_west = _maybe_float(row.get("westernmost_longitude"))
+        p_east = _maybe_float(row.get("easternmost_longitude"))
+        crosses = _truthy(row.get("footprints_cross_meridian"))
+        if None in (p_min_lat, p_max_lat, p_west, p_east):
+            fractions.append(1.0)
+            continue
+        lat_overlap = max(0.0, min(tile_max_lat, p_max_lat) - max(tile_min_lat, p_min_lat))
+        lon_overlap = _lon_interval_overlap(tile_min_lon, tile_max_lon, tile_crosses_wrap, p_west, p_east, crosses)
+        fraction = max(0.0, min((lat_overlap * lon_overlap) / tile_area, 1.0))
+        fractions.append(float(fraction))
+
+    out["intersection_area_approx"] = [float(value * tile_area) for value in fractions]
+    out["tile_area_approx"] = float(tile_area)
+    out["tile_coverage_fraction"] = fractions
+    out["full_tile_candidate"] = out["tile_coverage_fraction"] >= FULL_TILE_COVERAGE_FRACTION
+    out["coverage_estimate_method"] = "ode_product_bbox_fast"
+    return out
+
+
+def _add_ode_tile_coverage(products: pd.DataFrame, tile: LunarTile) -> pd.DataFrame:
+    """Compute true tile overlap for ODE WKT footprints instead of assuming 1.0."""
+    if products.empty or "footprint_wkt" not in products.columns:
+        return products
+    out = products.copy()
+    tile_polygon = _tile_polygon_360(tile)
+    tile_area = float(tile_polygon.area)
+    fractions: list[float] = []
+    areas: list[float] = []
+    contains_center: list[bool] = []
+    center = tile_center_point_for_footprints(tile, _dummy_360_gdf())
+    for value in out["footprint_wkt"].fillna(""):
+        try:
+            geom = wkt.loads(str(value))
+            area = float(geom.intersection(tile_polygon).area)
+            fraction = min(area / tile_area, 1.0) if tile_area > 0 else 0.0
+            contains = bool(geom.contains(center) or geom.touches(center))
+        except Exception:
+            area = 0.0
+            fraction = 0.0
+            contains = False
+        areas.append(area)
+        fractions.append(fraction)
+        contains_center.append(contains)
+    out["intersection_area_approx"] = areas
+    out["tile_area_approx"] = tile_area
+    out["tile_coverage_fraction"] = fractions
+    out["full_tile_candidate"] = out["tile_coverage_fraction"] >= FULL_TILE_COVERAGE_FRACTION
+    out["contains_center"] = contains_center
+    out["coverage_estimate_method"] = "ode_wkt_exact"
+    return out
+
+
+def _lon_interval_span(west: float, east: float, crosses: bool) -> float:
+    if crosses or east < west:
+        return (360.0 - west) + east
+    return east - west
+
+
+def _lon_intervals(west: float, east: float, crosses: bool) -> list[tuple[float, float]]:
+    west = west % 360.0
+    east = east % 360.0
+    if crosses or east < west:
+        return [(west, 360.0), (0.0, east)]
+    return [(west, east)]
+
+
+def _lon_interval_overlap(a_west: float, a_east: float, a_crosses: bool, b_west: float, b_east: float, b_crosses: bool) -> float:
+    overlap = 0.0
+    for aw, ae in _lon_intervals(a_west, a_east, a_crosses):
+        for bw, be in _lon_intervals(b_west, b_east, b_crosses):
+            overlap += max(0.0, min(ae, be) - max(aw, bw))
+    return overlap
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _tile_polygon_360(tile: LunarTile):
+    from shapely.geometry import Polygon
+
+    coords = []
+    for item in tile.bounds_latlon["corner_latlon"]:
+        coords.append((float(item["lon_360"]), float(item["lat"])))
+    return Polygon(coords)
+
+
+def _dummy_360_gdf() -> gpd.GeoDataFrame:
+    from shapely.geometry import Point
+
+    return gpd.GeoDataFrame(geometry=[Point(0, 0), Point(360, 0)])
+
+
+def _maybe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def enrich_lroc_metadata(products: pd.DataFrame) -> pd.DataFrame:
