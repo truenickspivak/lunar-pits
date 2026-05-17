@@ -1,9 +1,24 @@
 lola:
   dem_path: null
+  dem_url: "http://imbrium.mit.edu/DATA/LOLA_GDR/CYLINDRICAL/IMG/LDEM_16.IMG"
+  label_url: "http://imbrium.mit.edu/DATA/LOLA_GDR/CYLINDRICAL/IMG/LDEM_16.LBL"
+  cache_name: "LDEM_16.IMG"
+  label_cache_name: "LDEM_16.LBL"
+  format: "pds3_img"
+  native_resolution_m_per_pixel: 1895.21
+  high_res_dem_url: "https://planetarymaps.usgs.gov/mosaic/Lunar_LRO_LOLA_Global_LDEM_118m_Mar2014.tif"
 
 grail:
   bouguer_path: null
+  bouguer_url: "https://pgda.gsfc.nasa.gov/data/GRAIL_Local/gggrx_1200l_boug_l900.tif"
+  cache_name: "gggrx_1200l_boug_l900.tif"
+  native_resolution_m_per_pixel_estimate: 4550
 
 diviner:
-  day_temp_path: null
-  night_temp_path: null
+  max_temp_anomaly_path: null
+  max_temp_anomaly_url: "https://luna1.diviner.ucla.edu/~jpierre/diviner/level4_raster_data/diviner_tbol_max_anom.xyz"
+  max_temp_anomaly_cache_name: "diviner_tbol_max_anom.xyz"
+  min_temp_anomaly_path: null
+  min_temp_anomaly_url: "https://luna1.diviner.ucla.edu/~jpierre/diviner/level4_raster_data/diviner_tbol_min_anom.xyz"
+  min_temp_anomaly_cache_name: "diviner_tbol_min_anom.xyz"
+  native_resolution_m_per_pixel_estimate: 15160

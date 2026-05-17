@@ -2,7 +2,12 @@ from pathlib import PureWindowsPath
 import unittest
 
 from lunarpits.processing import normalize_product_id, windows_path_to_wsl
-from lunarpits.processing.lroc_product import build_processing_plan, parse_caminfo_center, tile_map_bounds_from_latlon
+from lunarpits.processing.lroc_product import (
+    build_processing_plan,
+    build_spiceinit_command,
+    parse_caminfo_center,
+    tile_map_bounds_from_latlon,
+)
 
 
 class ProcessingUtilsTest(unittest.TestCase):
@@ -38,6 +43,8 @@ class ProcessingUtilsTest(unittest.TestCase):
         second = tile_map_bounds_from_latlon(14.2, 303.3, 1)
         self.assertEqual(first, second)
         self.assertEqual(first.tile_id, "moon_1km_x-001719_y+000431")
+        self.assertEqual(first.projection_center_lat, 0.0)
+        self.assertEqual(first.projection_center_lon, 0.0)
         self.assertAlmostEqual(first.min_lat, 14.19698001633587)
         self.assertAlmostEqual(first.max_lon, 303.32750253641535)
 
@@ -64,6 +71,29 @@ class ProcessingUtilsTest(unittest.TestCase):
             output_dir=PureWindowsPath(r"C:\tmp\location\crops"),
         )
         self.assertEqual(str(plan.final_tif_win), r"C:\tmp\location\crops\M170932152LE.map.tif")
+
+    def test_build_spiceinit_command_preserves_default(self):
+        self.assertEqual(build_spiceinit_command("/tmp/in.cub"), "spiceinit from='/tmp/in.cub' web=yes")
+
+    def test_build_spiceinit_command_accepts_web_shape(self):
+        self.assertEqual(
+            build_spiceinit_command("/tmp/in.cub", spksmithed=True),
+            "spiceinit from='/tmp/in.cub' web=true spksmithed=true",
+        )
+
+    def test_build_spiceinit_command_can_require_smithed(self):
+        self.assertEqual(
+            build_spiceinit_command("/tmp/in.cub", spksmithed=True, require_smithed=True),
+            "spiceinit from='/tmp/in.cub' web=true spksmithed=true spkrecon=false",
+        )
+
+    def test_build_spiceinit_command_requires_user_model(self):
+        with self.assertRaises(ValueError):
+            build_spiceinit_command("/tmp/in.cub", shape="user")
+        self.assertEqual(
+            build_spiceinit_command("/tmp/in.cub", shape="user", shape_model="/tmp/lola.dem.cub"),
+            "spiceinit from='/tmp/in.cub' web=true shape=user model='/tmp/lola.dem.cub'",
+        )
 
 
 if __name__ == "__main__":

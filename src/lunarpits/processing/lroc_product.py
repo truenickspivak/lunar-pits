@@ -17,10 +17,11 @@ import logging
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from lunarpits.processing.identifiers import normalize_product_id
 
@@ -28,6 +29,7 @@ from lunarpits.processing.identifiers import normalize_product_id
 PROJECT_WIN = Path(r"C:\Users\nicks\desktop\lunar-pits")
 PDS_ROOT = "https://pds.lroc.im-ldi.com/data/LRO-L-LROC-2-EDR-V1.0"
 WSL_WORK_ROOT = "/tmp/lunar-pits-work"
+WSL_CACHE_ROOT = "/tmp/lunar-pits-cache"
 ISIS_ENV_NAME = "isis9.0.0"
 OUT_DIR_WIN = PROJECT_WIN / "data" / "processed" / "lroc_tif"
 TILE_OUT_DIR_WIN = PROJECT_WIN / "data" / "processed" / "lroc_tile_tif"
@@ -54,6 +56,10 @@ class LrocProcessingPlan:
     center_lat: float | None
     center_lon: float | None
     tile_map: "TileMapBounds | None" = None
+    shape: str | None = None
+    shape_model: str | None = None
+    echo_correct: bool = False
+    spksmithed: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,8 @@ class TileMapBounds:
     tile_id: str
     center_lat: float
     center_lon: float
+    projection_center_lat: float
+    projection_center_lon: float
     min_lat: float
     max_lat: float
     min_lon: float
@@ -123,6 +131,10 @@ def build_processing_plan(
     pixel_resolution: float = 0.5,
     tile_map: TileMapBounds | None = None,
     output_dir: Path | None = None,
+    shape: str | None = None,
+    shape_model: str | None = None,
+    echo_correct: bool = False,
+    spksmithed: bool = False,
 ) -> LrocProcessingPlan:
     product_id = normalize_product_id(product_id)
     if output_dir is not None:
@@ -138,6 +150,10 @@ def build_processing_plan(
         center_lat=tile_map.center_lat if tile_map else center_lat,
         center_lon=tile_map.center_lon if tile_map else center_lon,
         tile_map=tile_map,
+        shape=shape,
+        shape_model=shape_model,
+        echo_correct=echo_correct,
+        spksmithed=spksmithed,
     )
 
 
@@ -183,6 +199,49 @@ def run_isis_capture(command: str, *, check: bool = True) -> subprocess.Complete
         check=check,
         capture_output=True,
     )
+
+
+def build_spiceinit_command(
+    cub_wsl: str,
+    *,
+    shape: str | None = None,
+    shape_model: str | None = None,
+    spksmithed: bool = False,
+    require_smithed: bool = False,
+) -> str:
+    """Build spiceinit command while preserving legacy behavior by default."""
+    if shape is None and not spksmithed and not require_smithed:
+        return f"spiceinit from='{cub_wsl}' web=yes"
+
+    parts = [f"spiceinit from='{cub_wsl}'", "web=true"]
+    if spksmithed or require_smithed:
+        parts.append("spksmithed=true")
+    if require_smithed:
+        parts.append("spkrecon=false")
+    if shape is not None:
+        normalized = shape.lower()
+        if normalized not in {"system", "ellipsoid", "user"}:
+            raise ValueError("shape must be one of: system, ellipsoid, user")
+        if normalized == "user":
+            if not shape_model:
+                raise ValueError("shape=user requires --shape-model")
+            parts.extend(["shape=user", f"model='{shape_model}'"])
+        else:
+            if shape_model:
+                raise ValueError("--shape-model can only be used with shape=user")
+            parts.append(f"shape={normalized}")
+    elif shape_model:
+        raise ValueError("--shape-model requires shape=user")
+    return " ".join(parts)
+
+
+def timed_step(label: str, func: Callable[..., object], *args: object, **kwargs: object) -> object:
+    start = time.perf_counter()
+    LOGGER.info("[start] %s", label)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        LOGGER.info("[time] %s %.1fs", label, time.perf_counter() - start)
 
 
 def read_url_text(url: str, timeout: int = 30) -> str:
@@ -361,6 +420,8 @@ def tile_map_bounds_from_latlon(lat: float, lon: float, tile_size_km: float) -> 
         tile_id=tile.tile_id,
         center_lat=float(tile.center_lat),
         center_lon=float(tile.center_lon_360),
+        projection_center_lat=0.0,
+        projection_center_lon=0.0,
         min_lat=float(bounds["min_lat_approx"]),
         max_lat=float(bounds["max_lat_approx"]),
         min_lon=float(bounds["min_lon_360_approx"]),
@@ -390,8 +451,8 @@ def write_map_file_wsl(
   LatitudeType       = Planetocentric
   LongitudeDirection = PositiveEast
   LongitudeDomain    = 360
-  CenterLatitude     = {center_lat}
-  CenterLongitude    = {center_lon}
+  CenterLatitude     = {tile_map.projection_center_lat if tile_map is not None else center_lat}
+  CenterLongitude    = {tile_map.projection_center_lon if tile_map is not None else center_lon}
   PixelResolution    = {pixel_resolution} <meters/pixel>
 {range_text}End_Group
 End
@@ -414,6 +475,15 @@ def process_product(
     max_volume: int = 80,
     skip_if_exists: bool = False,
     dry_run: bool = False,
+    use_isis_cache: bool = True,
+    refresh_isis_cache: bool = False,
+    shape: str | None = None,
+    shape_model: str | None = None,
+    spksmithed: bool = False,
+    require_smithed: bool = False,
+    echo_correct: bool = False,
+    forwardpatch: bool = False,
+    patch_size: int = 100,
 ) -> LrocProcessingResult:
     product_id = normalize_product_id(product_id)
     plan = build_processing_plan(
@@ -423,6 +493,10 @@ def process_product(
         pixel_resolution=pixel_resolution,
         tile_map=tile_map,
         output_dir=output_dir,
+        shape=shape,
+        shape_model=shape_model,
+        echo_correct=echo_correct,
+        spksmithed=spksmithed,
     )
 
     if skip_if_exists and has_existing_geotiff_output(plan.final_tif_win):
@@ -441,13 +515,18 @@ def process_product(
 
     ensure_final_dir(plan.final_tif_win.parent)
 
-    located = locate_product_in_collections(product_id, max_volume=max_volume)
-    LOGGER.info("[located] %s", located.img_url)
-
     work_dir = plan.work_dir
+    cache_suffix = "default"
+    if shape:
+        cache_suffix = shape.lower()
+        if shape_model:
+            cache_suffix = f"{cache_suffix}-" + re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(shape_model).name)
+    cache_dir = f"{WSL_CACHE_ROOT}/{product_id}/{cache_suffix}"
+    cached_cal_wsl = f"{cache_dir}/{product_id}.cal.cub"
     img_wsl = f"{work_dir}/{product_id}.IMG"
     cub_wsl = f"{work_dir}/{product_id}.cub"
     cal_wsl = f"{work_dir}/{product_id}.cal.cub"
+    echo_wsl = f"{work_dir}/{product_id}.echo.cub"
     caminfo_wsl = f"{work_dir}/{product_id}.caminfo.pvl"
     map_pvl_wsl = f"{work_dir}/{product_id}.map.pvl"
     map_cub_wsl = f"{work_dir}/{product_id}.map.cub"
@@ -457,10 +536,29 @@ def process_product(
     final_created = False
 
     try:
-        download_url_to_wsl(located.img_url, img_wsl)
+        cache_hit = False
+        if use_isis_cache and tile_map is not None and not refresh_isis_cache:
+            cache_hit = run_wsl_shell(f"test -s '{cached_cal_wsl}'", check=False).returncode == 0
 
-        run_isis(f"lronac2isis from='{img_wsl}' to='{cub_wsl}'")
-        run_isis(f"spiceinit from='{cub_wsl}' web=yes")
+        if cache_hit:
+            LOGGER.info("[cache] Reusing calibrated ISIS cube: %s", cached_cal_wsl)
+            timed_step("copy cached calibrated cube", run_wsl_shell, f"cp '{cached_cal_wsl}' '{cal_wsl}'")
+        else:
+            located = locate_product_in_collections(product_id, max_volume=max_volume)
+            LOGGER.info("[located] %s", located.img_url)
+            timed_step("download IMG", download_url_to_wsl, located.img_url, img_wsl)
+            timed_step("lronac2isis", run_isis, f"lronac2isis from='{img_wsl}' to='{cub_wsl}'")
+            timed_step(
+                "spiceinit",
+                run_isis,
+                build_spiceinit_command(
+                    cub_wsl,
+                    shape=shape,
+                    shape_model=shape_model,
+                    spksmithed=spksmithed,
+                    require_smithed=require_smithed,
+                ),
+            )
 
         if tile_map is not None:
             center_lat = tile_map.center_lat
@@ -493,12 +591,30 @@ def process_product(
 
         write_map_file_wsl(map_pvl_wsl, center_lat, center_lon, effective_pixel_resolution, tile_map)
 
-        run_isis(f"lronaccal from='{cub_wsl}' to='{cal_wsl}'")
+        if not cache_hit:
+            timed_step("lronaccal", run_isis, f"lronaccal from='{cub_wsl}' to='{cal_wsl}'")
+            if use_isis_cache:
+                timed_step(
+                    "cache calibrated cube",
+                    run_wsl_shell,
+                    f"mkdir -p '{cache_dir}' && cp '{cal_wsl}' '{cached_cal_wsl}'",
+                )
+        map_input_wsl = cal_wsl
+        if echo_correct:
+            timed_step("lronacecho", run_isis, f"lronacecho from='{cal_wsl}' to='{echo_wsl}'")
+            map_input_wsl = echo_wsl
         default_range = "map" if tile_map is not None else "camera"
-        run_isis(f"cam2map from='{cal_wsl}' map='{map_pvl_wsl}' to='{map_cub_wsl}' defaultrange={default_range} pixres=map")
-        run_isis(
+        warp_args = f" warpalgorithm=forwardpatch patchsize={int(patch_size)}" if forwardpatch else ""
+        timed_step(
+            "cam2map",
+            run_isis,
+            f"cam2map from='{map_input_wsl}' map='{map_pvl_wsl}' to='{map_cub_wsl}' defaultrange={default_range} pixres=map{warp_args}",
+        )
+        timed_step(
+            "gdal_translate GeoTIFF",
+            run_isis,
             "gdal_translate -of GTiff -co COMPRESS=LZW -co TILED=YES -co BIGTIFF=IF_SAFER "
-            f"'{map_cub_wsl}' '{temp_geotiff_wsl}'"
+            f"'{map_cub_wsl}' '{temp_geotiff_wsl}'",
         )
         run_wsl_shell(f"test -s '{temp_geotiff_wsl}'")
 
@@ -538,6 +654,15 @@ def process_product_to_geotiff(
     keep_temp: bool = False,
     max_volume: int = 80,
     skip_if_exists: bool = False,
+    use_isis_cache: bool = True,
+    refresh_isis_cache: bool = False,
+    shape: str | None = None,
+    shape_model: str | None = None,
+    spksmithed: bool = False,
+    require_smithed: bool = False,
+    echo_correct: bool = False,
+    forwardpatch: bool = False,
+    patch_size: int = 100,
 ) -> Path:
     """Process a LROC product id and return the Python-readable GeoTIFF path."""
     tile_map = None
@@ -555,6 +680,15 @@ def process_product_to_geotiff(
         keep_temp=keep_temp,
         max_volume=max_volume,
         skip_if_exists=skip_if_exists,
+        use_isis_cache=use_isis_cache,
+        refresh_isis_cache=refresh_isis_cache,
+        shape=shape,
+        shape_model=shape_model,
+        spksmithed=spksmithed,
+        require_smithed=require_smithed,
+        echo_correct=echo_correct,
+        forwardpatch=forwardpatch,
+        patch_size=patch_size,
     )
     return result.final_tif
 
@@ -572,6 +706,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-temp", action="store_true", help="Do not delete WSL temp workspace after processing")
     parser.add_argument("--max-volume", type=int, default=80, help="Maximum LROLRC volume number to search")
     parser.add_argument("--skip-if-exists", action="store_true", help="Return successfully without processing when the output GeoTIFF already exists")
+    parser.add_argument("--no-isis-cache", action="store_true", help="Disable reuse of cached calibrated ISIS cubes")
+    parser.add_argument("--refresh-isis-cache", action="store_true", help="Rebuild the cached calibrated ISIS cube for this product")
+    parser.add_argument(
+        "--shape",
+        choices=["system", "ellipsoid", "user"],
+        default=None,
+        help="Optional ISIS spiceinit shape mode. Omitted preserves legacy behavior; user enables a supplied DEM/shape cube.",
+    )
+    parser.add_argument("--shape-model", default=None, help="WSL path to a DEM/shape cube for --shape user")
+    parser.add_argument("--spksmithed", action="store_true", help="Use spiceinit spksmithed=true, as recommended by the LROC NAC processing guide when available")
+    parser.add_argument("--require-smithed", action="store_true", help="Require smithed SPK kernels by adding spkrecon=false")
+    parser.add_argument("--echo-correct", action="store_true", help="Run lronacecho after lronaccal before cam2map")
+    parser.add_argument("--forwardpatch", action="store_true", help="Run cam2map with warpalgorithm=forwardpatch")
+    parser.add_argument("--patch-size", type=int, default=100, help="cam2map forwardpatch patchsize")
+    parser.add_argument(
+        "--guide-pipeline",
+        action="store_true",
+        help="Shortcut for guide-style processing: --spksmithed --echo-correct --forwardpatch --patch-size 100",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the normalized product id and output plan without downloading or running WSL/ISIS")
     parser.add_argument("--verbose", action="store_true", help="Show verbose discovery logging")
     return parser
@@ -583,6 +736,11 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(args.verbose)
 
     try:
+        if args.guide_pipeline:
+            args.spksmithed = True
+            args.echo_correct = True
+            args.forwardpatch = True
+            args.patch_size = 100
         tile_map = None
         if args.tile_lat is not None or args.tile_lon is not None or args.tile_size_km is not None:
             if args.tile_lat is None or args.tile_lon is None or args.tile_size_km is None:
@@ -599,6 +757,15 @@ def main(argv: list[str] | None = None) -> int:
             max_volume=args.max_volume,
             skip_if_exists=args.skip_if_exists,
             dry_run=args.dry_run,
+            use_isis_cache=not args.no_isis_cache,
+            refresh_isis_cache=args.refresh_isis_cache,
+            shape=args.shape,
+            shape_model=args.shape_model,
+            spksmithed=args.spksmithed,
+            require_smithed=args.require_smithed,
+            echo_correct=args.echo_correct,
+            forwardpatch=args.forwardpatch,
+            patch_size=args.patch_size,
         )
     except subprocess.CalledProcessError as exc:
         LOGGER.error("\n[ERROR] Command failed with exit code %s", exc.returncode)

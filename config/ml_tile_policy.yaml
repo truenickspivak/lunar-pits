@@ -1,0 +1,6 @@
+normalization_policy: preserve_float32
+preview_min: 0.04801061004400253
+preview_max: 0.06929260492324829
+ml_clip_min: null
+ml_clip_max: null
+nodata_value: -9999.0

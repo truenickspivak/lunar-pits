@@ -22,11 +22,12 @@ PHASE_COLUMNS = ("phase_angle", "PHASE_ANGL", "PHASE")
 RESOLUTION_COLUMNS = ("resolution_m_per_pixel", "RESOLUTION", "resolution")
 FULL_TILE_COVERAGE_FRACTION = 0.95
 NEAR_FULL_TILE_COVERAGE_FRACTION = 0.75
-RESOLUTION_SIMILAR_RELATIVE_TOLERANCE = 0.50
-RESOLUTION_SIMILAR_ABSOLUTE_TOLERANCE_M = 0.50
+RESOLUTION_SIMILAR_RELATIVE_TOLERANCE = 0.35
+RESOLUTION_SIMILAR_ABSOLUTE_TOLERANCE_M = 0.20
 MIN_USABLE_INCIDENCE_DEG = 5.0
 MAX_USABLE_INCIDENCE_DEG = 90.0
 MAX_USABLE_EMISSION_DEG = 45.0
+MAX_ALIGNED_EMISSION_DEG = 15.0
 MIN_USABLE_PHASE_DEG = 10.0
 MAX_USABLE_PHASE_DEG = 120.0
 
@@ -162,6 +163,7 @@ def rank_lroc_nac_edr_for_tile(products: pd.DataFrame) -> pd.DataFrame:
     work["full_tile_candidate"] = work["tile_coverage_fraction"] >= FULL_TILE_COVERAGE_FRACTION
     work["near_full_tile_candidate"] = work["tile_coverage_fraction"] >= NEAR_FULL_TILE_COVERAGE_FRACTION
     work["usable_observation_geometry"] = work.apply(_has_usable_observation_geometry, axis=1)
+    work["aligned_observation_geometry"] = work.apply(_has_aligned_observation_geometry, axis=1)
 
     def coverage_tier(value: float) -> int:
         if value >= FULL_TILE_COVERAGE_FRACTION:
@@ -188,12 +190,14 @@ def rank_lroc_nac_edr_for_tile(products: pd.DataFrame) -> pd.DataFrame:
 
     work["tile_rank_score"] = (
         work["tile_coverage_fraction"] * 1000.0
+        + work["usable_observation_geometry"].astype(float) * 250.0
+        + work["aligned_observation_geometry"].astype(float) * 25.0
         - work["_resolution_rank"] * 100.0
         - work["resolution_m_per_pixel"].fillna(99.0) * 10.0
     )
     ranked = work.sort_values(
-        ["_coverage_tier", "_resolution_rank", "resolution_m_per_pixel", "product_id"],
-        ascending=[True, True, True, True],
+        ["_coverage_tier", "usable_observation_geometry", "_resolution_rank", "resolution_m_per_pixel", "product_id"],
+        ascending=[True, False, True, True, True],
         na_position="last",
     ).copy()
     ranked["tile_processing_rank"] = range(1, len(ranked) + 1)
@@ -268,9 +272,9 @@ def select_top_lroc_nac_for_tile(products: pd.DataFrame, max_products: int = 3) 
                 if pd.notna(row.get("resolution_m_per_pixel")) and pd.notna(anchor_resolution):
                     resolution_delta = abs(float(row["resolution_m_per_pixel"]) - float(anchor_resolution))
                 return (
-                    incidence_gap * 10.0,
                     float(row.get("tile_coverage_fraction") or 0.0),
                     -resolution_delta,
+                    incidence_gap,
                     str(row["product_id"]),
                 )
 
@@ -285,8 +289,10 @@ def select_top_lroc_nac_for_tile(products: pd.DataFrame, max_products: int = 3) 
 def _selection_pools(products: pd.DataFrame) -> list[pd.DataFrame]:
     pools = [
         products[products["full_tile_candidate"] & products["usable_observation_geometry"]].copy(),
+        products[products["full_tile_candidate"] & products["aligned_observation_geometry"]].copy(),
         products[products["full_tile_candidate"] & ~products["usable_observation_geometry"]].copy(),
         products[(~products["full_tile_candidate"]) & (products["near_full_tile_candidate"]) & products["usable_observation_geometry"]].copy(),
+        products[(~products["full_tile_candidate"]) & (products["near_full_tile_candidate"]) & products["aligned_observation_geometry"]].copy(),
         products[(~products["full_tile_candidate"]) & (products["near_full_tile_candidate"]) & ~products["usable_observation_geometry"]].copy(),
         products[(~products["full_tile_candidate"]) & (~products["near_full_tile_candidate"]) & products["usable_observation_geometry"]].copy(),
         products[(~products["full_tile_candidate"]) & (~products["near_full_tile_candidate"]) & ~products["usable_observation_geometry"]].copy(),
@@ -305,6 +311,12 @@ def _has_usable_observation_geometry(row: pd.Series) -> bool:
     if pd.notna(phase) and not (MIN_USABLE_PHASE_DEG <= float(phase) <= MAX_USABLE_PHASE_DEG):
         return False
     return True
+
+
+def _has_aligned_observation_geometry(row: pd.Series) -> bool:
+    """Return true for products likely to keep steep pit features close to ground coordinates."""
+    emission = row.get("emission_angle")
+    return pd.isna(emission) or float(emission) <= MAX_ALIGNED_EMISSION_DEG
 
 
 def crop_nac_to_tile(product_id: str, tile: LunarTile, output_dir: str | Path) -> dict[str, Any]:

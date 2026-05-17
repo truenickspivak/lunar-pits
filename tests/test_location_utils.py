@@ -9,7 +9,9 @@ from lunarpits.location import (
     volume_names,
 )
 from lunarpits.location.lroc_search import _query_footprint_geodataframe, score_nac_metadata_quality
+from lunarpits.location.gather_location import find_existing_context_for_tile
 from lunarpits.processing import normalize_product_id
+from lunar_tile_pipeline.tiling import get_tile_for_latlon
 
 
 class LocationUtilsTest(unittest.TestCase):
@@ -33,6 +35,21 @@ class LocationUtilsTest(unittest.TestCase):
 
     def test_safe_location_label_for_batch_folder(self):
         self.assertEqual(safe_location_label("site 01/Tranquility"), "site_01_Tranquility")
+
+    def test_existing_context_for_tile_detects_duplicate_folder(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        tile = get_tile_for_latlon(14.2, 303.3, tile_size_km=0.5)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / "first_site"
+            current = root / "second_site"
+            existing.mkdir()
+            current.mkdir()
+            (existing / "tile_metadata.json").write_text(json.dumps({"tile_id": tile.tile_id}), encoding="utf-8")
+            self.assertEqual(find_existing_context_for_tile(tile.tile_id, root, exclude=current), existing)
 
     def test_longitude_normalization(self):
         self.assertEqual(normalize_longitude_360(-56), 304)
